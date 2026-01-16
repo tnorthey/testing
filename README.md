@@ -22,3 +22,18 @@ python crypto_price_move_correlation.py \
 
 The script expects CSV files with timestamp and price columns. Use the column
 flags (`--btc-time-column`, `--btc-price-column`, etc.) to match your data.
+
+## CoinGecko CSV fetch
+
+Use `fetch_coingecko_prices.py` to download BTC/ETH price data from CoinGecko
+and write CSV files for testing.
+
+Example:
+
+python fetch_coingecko_prices.py \
+  --days 30 \
+  --output-dir data
+
+This writes `data/btc.csv` and `data/eth.csv` by default. Use `--coins` to
+specify other CoinGecko ids, or `--use-coin-id-filenames` to use the ids as
+filenames.
