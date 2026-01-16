@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fetch historical price data from CoinGecko and write CSVs.
+Fetch historical price data from CoinGecko and write CSVs (hourly by default).
 
 CoinGecko API docs: https://www.coingecko.com/en/api/documentation
 """
@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +27,9 @@ SYMBOL_FILENAMES = {
     "bitcoin": "btc",
     "ethereum": "eth",
 }
+SECONDS_PER_DAY = 86400
+SECONDS_PER_HOUR = 3600
+MAX_RANGE_DAYS = 90
 
 
 @dataclass(frozen=True)
@@ -115,8 +119,8 @@ def resolve_output_path(coin_id: str, output_dir: str, use_symbol: bool) -> str:
     return os.path.join(output_dir, f"{filename}.csv")
 
 
-def write_prices_csv(prices: Iterable[Sequence[float]], path: str) -> int:
-    rows = []
+def normalize_prices(prices: Iterable[Sequence[float]]) -> list[tuple[int, float]]:
+    rows: list[tuple[int, float]] = []
     for entry in prices:
         if len(entry) < 2:
             continue
@@ -130,13 +134,111 @@ def write_prices_csv(prices: Iterable[Sequence[float]], path: str) -> int:
 
     rows.sort(key=lambda item: item[0])
 
+    deduped: list[tuple[int, float]] = []
+    for ts_seconds, price_value in rows:
+        if deduped and deduped[-1][0] == ts_seconds:
+            deduped[-1] = (ts_seconds, price_value)
+        else:
+            deduped.append((ts_seconds, price_value))
+    return deduped
+
+
+def downsample_to_hourly(rows: Sequence[tuple[int, float]]) -> list[tuple[int, float]]:
+    hourly: list[tuple[int, float]] = []
+    current_bucket: int | None = None
+    for ts_seconds, price_value in rows:
+        bucket = ts_seconds - (ts_seconds % SECONDS_PER_HOUR)
+        if bucket != current_bucket:
+            hourly.append((bucket, price_value))
+            current_bucket = bucket
+        else:
+            hourly[-1] = (bucket, price_value)
+    return hourly
+
+
+def fetch_prices_range_chunked(
+    coin_id: str,
+    vs_currency: str,
+    start: int,
+    end: int,
+    chunk_days: int,
+) -> list[Sequence[float]]:
+    if start >= end:
+        raise ValueError("Start must be before end.")
+    chunk_seconds = chunk_days * SECONDS_PER_DAY
+    prices: list[Sequence[float]] = []
+    current_start = start
+    while current_start < end:
+        current_end = min(current_start + chunk_seconds, end)
+        url = build_url(coin_id, vs_currency, None, current_start, current_end)
+        chart = fetch_market_chart(url)
+        prices.extend(chart.prices)
+        current_start = current_end
+    return prices
+
+
+def resolve_range(
+    days: float | None,
+    start: int | None,
+    end: int | None,
+) -> tuple[int, int]:
+    if start is not None or end is not None:
+        if start is None or end is None:
+            raise ValueError("Both start and end are required for range fetch.")
+        if start >= end:
+            raise ValueError("Start must be before end.")
+        return start, end
+    if days is None:
+        raise ValueError("Days must be provided when start/end not supplied.")
+    end_ts = int(time.time())
+    start_ts = end_ts - int(days * SECONDS_PER_DAY)
+    if start_ts >= end_ts:
+        raise ValueError("Days must be positive.")
+    return start_ts, end_ts
+
+
+def fetch_prices(
+    coin_id: str,
+    vs_currency: str,
+    days: float | None,
+    start: int | None,
+    end: int | None,
+    granularity: str,
+) -> list[tuple[int, float]]:
+    if granularity == "hourly":
+        start_ts, end_ts = resolve_range(days, start, end)
+        raw_prices = fetch_prices_range_chunked(
+            coin_id=coin_id,
+            vs_currency=vs_currency,
+            start=start_ts,
+            end=end_ts,
+            chunk_days=MAX_RANGE_DAYS,
+        )
+        rows = normalize_prices(raw_prices)
+        return downsample_to_hourly(rows)
+
+    if start is not None or end is not None:
+        if start is None or end is None:
+            raise ValueError("Both start and end are required for range fetch.")
+        url = build_url(coin_id, vs_currency, None, start, end)
+    else:
+        if days is None:
+            raise ValueError("Days must be provided when start/end not supplied.")
+        url = build_url(coin_id, vs_currency, days, None, None)
+
+    chart = fetch_market_chart(url)
+    return normalize_prices(chart.prices)
+
+
+def write_prices_csv(rows: Iterable[tuple[int, float]], path: str) -> int:
+    sorted_rows = sorted(rows, key=lambda item: item[0])
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["timestamp", "close"])
-        for ts_seconds, price_value in rows:
+        for ts_seconds, price_value in sorted_rows:
             writer.writerow([ts_seconds, price_value])
 
-    return len(rows)
+    return len(sorted_rows)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -168,6 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Range end timestamp (epoch or ISO). Requires --start.",
     )
     parser.add_argument(
+        "--granularity",
+        choices=("hourly", "raw"),
+        default="hourly",
+        help="Output granularity: hourly closes or raw API data (default: hourly).",
+    )
+    parser.add_argument(
         "--output-dir",
         default="data",
         help="Output directory for CSVs (default: data).",
@@ -191,7 +299,6 @@ def main() -> int:
         return 1
 
     start = end = None
-    days: float | None = args.days
     if args.start or args.end:
         if not args.start or not args.end:
             print("Error: --start and --end must be provided together.", file=sys.stderr)
@@ -202,15 +309,20 @@ def main() -> int:
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        days = None
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     for coin_id in coin_ids:
-        url = build_url(coin_id, args.vs_currency, days, start, end)
         try:
-            chart = fetch_market_chart(url)
-        except RuntimeError as exc:
+            rows = fetch_prices(
+                coin_id=coin_id,
+                vs_currency=args.vs_currency,
+                days=args.days,
+                start=start,
+                end=end,
+                granularity=args.granularity,
+            )
+        except (RuntimeError, ValueError) as exc:
             print(f"Error fetching {coin_id}: {exc}", file=sys.stderr)
             return 1
         output_path = resolve_output_path(
@@ -218,7 +330,7 @@ def main() -> int:
             output_dir=args.output_dir,
             use_symbol=not args.use_coin_id_filenames,
         )
-        row_count = write_prices_csv(chart.prices, output_path)
+        row_count = write_prices_csv(rows, output_path)
         print(f"Wrote {row_count} rows to {output_path}")
 
     return 0
