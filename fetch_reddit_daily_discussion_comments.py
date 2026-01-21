@@ -14,6 +14,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -22,6 +23,89 @@ REDDIT_API_BASE = "https://www.reddit.com"
 DEFAULT_QUERIES = "Daily Discussion,Daily General Discussion"
 DEFAULT_USER_AGENT = "crypto-price-correlation-script (reddit-daily-comments)"
 POST_ID_RE = re.compile(r"/comments/([a-z0-9]+)/")
+WORD_RE = re.compile(r"[A-Za-z][A-Za-z']{2,}")
+TICKER_RE = re.compile(r"\$[A-Za-z]{2,6}")
+STOPWORDS = {
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "all",
+    "also",
+    "and",
+    "any",
+    "are",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "can",
+    "could",
+    "did",
+    "does",
+    "doing",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "had",
+    "has",
+    "have",
+    "having",
+    "here",
+    "how",
+    "into",
+    "its",
+    "just",
+    "more",
+    "most",
+    "not",
+    "now",
+    "off",
+    "once",
+    "only",
+    "other",
+    "out",
+    "over",
+    "same",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "too",
+    "under",
+    "until",
+    "very",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "will",
+    "with",
+    "you",
+    "your",
+}
 
 
 @dataclass(frozen=True)
@@ -249,6 +333,82 @@ def format_timestamp(ts: int) -> str:
     return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat()
 
 
+def to_ascii(text: str) -> str:
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
+def truncate_text(text: str, limit: int) -> str:
+    cleaned = " ".join(text.split())
+    cleaned = to_ascii(cleaned)
+    if len(cleaned) <= limit:
+        return cleaned
+    if limit <= 3:
+        return cleaned[:limit]
+    return cleaned[: limit - 3].rstrip() + "..."
+
+
+def summarize_comments(
+    comments: Iterable[RedditComment],
+    post: RedditPost,
+    max_terms: int = 10,
+    max_authors: int = 5,
+    max_examples: int = 3,
+) -> str:
+    comments_list = list(comments)
+    if not comments_list:
+        return "No comments available to summarize."
+
+    author_counts = Counter(comment.author for comment in comments_list)
+    word_counts: Counter[str] = Counter()
+    ticker_counts: Counter[str] = Counter()
+    timestamps = [comment.created_utc for comment in comments_list]
+
+    for comment in comments_list:
+        body = comment.body
+        for match in WORD_RE.finditer(body.lower()):
+            word = match.group(0)
+            if word in STOPWORDS:
+                continue
+            word_counts[word] += 1
+        for match in TICKER_RE.finditer(body):
+            ticker_counts[match.group(0).upper()] += 1
+
+    top_terms = [f"{term} ({count})" for term, count in word_counts.most_common(max_terms)]
+    top_authors = [
+        f"{author} ({count})" for author, count in author_counts.most_common(max_authors)
+    ]
+    top_tickers = [
+        f"{ticker} ({count})" for ticker, count in ticker_counts.most_common(5)
+    ]
+    top_scored = sorted(comments_list, key=lambda comment: comment.score, reverse=True)[
+        :max_examples
+    ]
+
+    lines = [
+        f"Summary for '{to_ascii(post.title)}'",
+        f"Post URL: {post.url}",
+        f"Comments: {len(comments_list)} | Unique authors: {len(author_counts)}",
+        (
+            "Time range (UTC): "
+            f"{format_timestamp(min(timestamps))} to {format_timestamp(max(timestamps))}"
+        ),
+    ]
+
+    if top_tickers:
+        lines.append("Top tickers: " + ", ".join(top_tickers))
+    if top_terms:
+        lines.append("Top keywords: " + ", ".join(top_terms))
+    if top_authors:
+        lines.append("Top commenters: " + ", ".join(top_authors))
+    if top_scored:
+        lines.append("Top scored comments:")
+        for comment in top_scored:
+            snippet = truncate_text(comment.body, 160)
+            lines.append(f"- ({comment.score}) {snippet}")
+
+    return "\n".join(lines)
+
+
 def write_jsonl(
     comments: Iterable[RedditComment],
     post: RedditPost,
@@ -401,6 +561,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output path (default: stdout).",
     )
     parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print a text summary to stderr after fetching comments.",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Only print the summary to stdout (skip comment output).",
+    )
+    parser.add_argument(
         "--user-agent",
         default=DEFAULT_USER_AGENT,
         help="User-Agent string for Reddit requests.",
@@ -491,20 +661,31 @@ def main() -> int:
         max_comments=max_comments,
     )
 
-    output_handle = None
-    try:
-        if args.output:
-            output_handle = open(args.output, "w", newline="", encoding="utf-8")
-        else:
-            output_handle = sys.stdout
+    summary_only = args.summary_only
+    summary_text = None
+    if args.summary or summary_only:
+        summary_text = summarize_comments(comments, post)
 
-        if args.format == "csv":
-            write_csv(comments, post, output_handle)
-        else:
-            write_jsonl(comments, post, output_handle)
-    finally:
-        if output_handle is not None and output_handle is not sys.stdout:
-            output_handle.close()
+    if summary_only:
+        print(summary_text)
+    else:
+        output_handle = None
+        try:
+            if args.output:
+                output_handle = open(args.output, "w", newline="", encoding="utf-8")
+            else:
+                output_handle = sys.stdout
+
+            if args.format == "csv":
+                write_csv(comments, post, output_handle)
+            else:
+                write_jsonl(comments, post, output_handle)
+        finally:
+            if output_handle is not None and output_handle is not sys.stdout:
+                output_handle.close()
+
+    if args.summary and not summary_only and summary_text is not None:
+        print(summary_text, file=sys.stderr)
 
     print(
         f"Fetched {len(comments)} comments from '{post.title}' ({post.url})",
