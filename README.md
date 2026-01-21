@@ -37,3 +37,25 @@ python fetch_coingecko_prices.py \
 This writes `data/btc.csv` and `data/eth.csv` by default. Use `--coins` to
 specify other CoinGecko ids, or `--use-coin-id-filenames` to use the ids as
 filenames.
+
+## Reddit daily discussion comments
+
+Use `fetch_reddit_daily_discussion_comments.py` to locate the latest Ethereum
+daily discussion thread and export its comments.
+
+Example:
+
+python fetch_reddit_daily_discussion_comments.py \
+  --output daily_comments.jsonl
+
+To print a quick summary without writing comment data:
+
+python fetch_reddit_daily_discussion_comments.py \
+  --summary-only
+
+You can also pass a specific post URL or id if you already know it:
+
+python fetch_reddit_daily_discussion_comments.py \
+  --post-url "https://www.reddit.com/r/ethereum/comments/abcdef/daily_discussion/" \
+  --format csv \
+  --output daily_comments.csv
