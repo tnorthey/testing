@@ -38,6 +38,21 @@ This writes `data/btc.csv` and `data/eth.csv` by default. Use `--coins` to
 specify other CoinGecko ids, or `--use-coin-id-filenames` to use the ids as
 filenames.
 
+You can also use the script to pull Coinglass indicator data (for example, the
+Bitcoin 2-year MA multiplier) if you have a Coinglass API key:
+
+export COINGLASS_API_KEY="your-coinglass-key"
+
+python fetch_coingecko_prices.py \
+  --source coinglass \
+  --coinglass-endpoint "public/v2/indicator/bitcoin" \
+  --coinglass-params "indicator=2year_ma_multiplier" \
+  --coinglass-data-key "data" \
+  --output-dir data
+
+Adjust `--coinglass-endpoint` and `--coinglass-params` to match the metric
+available in your Coinglass plan.
+
 ## Reddit daily discussion comments
 
 Use `fetch_reddit_daily_discussion_comments.py` to locate the latest Ethereum
