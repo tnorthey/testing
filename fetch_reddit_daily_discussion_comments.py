@@ -9,6 +9,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -22,8 +23,10 @@ from typing import Iterable, Optional
 
 
 REDDIT_API_BASE = "https://www.reddit.com"
+OPENAI_API_BASE = "https://api.openai.com/v1"
 DEFAULT_QUERIES = "Daily Discussion,Daily General Discussion"
 DEFAULT_USER_AGENT = "crypto-price-correlation-script (reddit-daily-comments)"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 POST_ID_RE = re.compile(r"/comments/([a-z0-9]+)/")
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z']{2,}")
 TICKER_RE = re.compile(r"\$[A-Za-z]{2,6}")
@@ -438,7 +441,7 @@ def build_comment_corpus(
     return "\n".join(lines), count
 
 
-def build_ollama_prompt(
+def build_ai_prompt(
     post: RedditPost,
     total_comments: int,
     sample_comments: int,
@@ -463,6 +466,65 @@ def build_ollama_prompt(
     if not corpus:
         corpus = "- (0) No comment text available."
     return "\n".join(header) + "\n" + corpus
+
+
+def get_openai_api_key(value: Optional[str]) -> str:
+    api_key = value or os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "OpenAI API key is required. Provide --openai-api-key or set OPENAI_API_KEY."
+        )
+    return api_key
+
+
+def run_openai_chat(
+    prompt: str,
+    model: str,
+    api_key: str,
+    timeout: int,
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You summarize Reddit comment threads with concise, factual bullets.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OPENAI_API_BASE}/chat/completions",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_data = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+        message = error_body.strip() or f"{exc.code} {exc.reason}"
+        raise RuntimeError(f"OpenAI request failed: {message}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"OpenAI request failed: {exc.reason}") from exc
+
+    parsed = json.loads(response_data)
+    choices = parsed.get("choices", [])
+    if not choices:
+        raise RuntimeError("OpenAI response missing choices.")
+    content = choices[0].get("message", {}).get("content", "")
+    if not content:
+        raise RuntimeError("OpenAI response missing content.")
+    return content.strip()
 
 
 def run_ollama(prompt: str, model: str, timeout: int) -> str:
@@ -501,8 +563,28 @@ def summarize_with_ollama(
         return "No comments available to summarize."
     sorted_comments = sorted(comments_list, key=lambda comment: comment.score, reverse=True)
     corpus, sample_count = build_comment_corpus(sorted_comments, max_chars, max_comments)
-    prompt = build_ollama_prompt(post, len(comments_list), sample_count, corpus)
+    prompt = build_ai_prompt(post, len(comments_list), sample_count, corpus)
     return run_ollama(prompt, model, timeout)
+
+
+def summarize_with_chatgpt(
+    comments: Iterable[RedditComment],
+    post: RedditPost,
+    model: str,
+    api_key: str,
+    max_chars: int,
+    max_comments: int,
+    timeout: int,
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    comments_list = list(comments)
+    if not comments_list:
+        return "No comments available to summarize."
+    sorted_comments = sorted(comments_list, key=lambda comment: comment.score, reverse=True)
+    corpus, sample_count = build_comment_corpus(sorted_comments, max_chars, max_comments)
+    prompt = build_ai_prompt(post, len(comments_list), sample_count, corpus)
+    return run_openai_chat(prompt, model, api_key, timeout, max_tokens, temperature)
 
 
 def write_jsonl(
@@ -672,6 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use a local Ollama model for the summary.",
     )
     parser.add_argument(
+        "--summary-chatgpt",
+        action="store_true",
+        help="Use the ChatGPT API for the summary.",
+    )
+    parser.add_argument(
         "--ollama-model",
         default="llama3",
         help="Ollama model name (default: llama3).",
@@ -693,6 +780,45 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=180,
         help="Timeout for Ollama run in seconds (default: 180).",
+    )
+    parser.add_argument(
+        "--openai-model",
+        default=DEFAULT_OPENAI_MODEL,
+        help="OpenAI model name (default: gpt-4o-mini).",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        help="OpenAI API key (defaults to OPENAI_API_KEY).",
+    )
+    parser.add_argument(
+        "--openai-max-chars",
+        type=int,
+        default=12000,
+        help="Max characters of comment text sent to OpenAI (default: 12000).",
+    )
+    parser.add_argument(
+        "--openai-max-comments",
+        type=int,
+        default=200,
+        help="Max comments sent to OpenAI (default: 200).",
+    )
+    parser.add_argument(
+        "--openai-timeout",
+        type=int,
+        default=60,
+        help="Timeout for OpenAI request in seconds (default: 60).",
+    )
+    parser.add_argument(
+        "--openai-max-tokens",
+        type=int,
+        default=300,
+        help="Max tokens for the OpenAI response (default: 300).",
+    )
+    parser.add_argument(
+        "--openai-temperature",
+        type=float,
+        default=0.2,
+        help="OpenAI temperature setting (default: 0.2).",
     )
     parser.add_argument(
         "--user-agent",
@@ -734,6 +860,10 @@ def find_daily_post(args: argparse.Namespace) -> RedditPost:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.summary_ollama and args.summary_chatgpt:
+        print("Error: choose only one of --summary-ollama or --summary-chatgpt.", file=sys.stderr)
+        return 1
 
     post_id = None
     post = None
@@ -786,10 +916,33 @@ def main() -> int:
     )
 
     summary_only = args.summary_only
-    summary_requested = args.summary or summary_only or args.summary_ollama
+    summary_requested = (
+        args.summary or summary_only or args.summary_ollama or args.summary_chatgpt
+    )
     summary_text = None
     if summary_requested:
-        if args.summary_ollama:
+        if args.summary_chatgpt:
+            try:
+                api_key = get_openai_api_key(args.openai_api_key)
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            try:
+                summary_text = summarize_with_chatgpt(
+                    comments=comments,
+                    post=post,
+                    model=args.openai_model,
+                    api_key=api_key,
+                    max_chars=args.openai_max_chars,
+                    max_comments=args.openai_max_comments,
+                    timeout=args.openai_timeout,
+                    max_tokens=args.openai_max_tokens,
+                    temperature=args.openai_temperature,
+                )
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        elif args.summary_ollama:
             summary_text = summarize_with_ollama(
                 comments=comments,
                 post=post,

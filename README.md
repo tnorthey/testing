@@ -60,6 +60,15 @@ python fetch_reddit_daily_discussion_comments.py \
   --summary-ollama \
   --ollama-model llama3
 
+To use the ChatGPT API for an AI summary:
+
+export OPENAI_API_KEY="your-key-here"
+
+python fetch_reddit_daily_discussion_comments.py \
+  --summary-only \
+  --summary-chatgpt \
+  --openai-model gpt-4o-mini
+
 You can also pass a specific post URL or id if you already know it:
 
 python fetch_reddit_daily_discussion_comments.py \
