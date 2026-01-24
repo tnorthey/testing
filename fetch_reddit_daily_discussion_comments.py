@@ -10,6 +10,8 @@ import csv
 import datetime as dt
 import json
 import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -409,6 +411,100 @@ def summarize_comments(
     return "\n".join(lines)
 
 
+def build_comment_corpus(
+    comments: Iterable[RedditComment],
+    max_chars: int,
+    max_comments: int,
+) -> tuple[str, int]:
+    lines: list[str] = []
+    count = 0
+    used = 0
+    limit_chars = max_chars if max_chars > 0 else None
+    limit_comments = max_comments if max_comments > 0 else None
+
+    for comment in comments:
+        if limit_comments and count >= limit_comments:
+            break
+        body = " ".join(comment.body.split())
+        if not body:
+            continue
+        line = f"- ({comment.score}) {body}"
+        if limit_chars is not None and used + len(line) + 1 > limit_chars:
+            break
+        lines.append(line)
+        used += len(line) + 1
+        count += 1
+
+    return "\n".join(lines), count
+
+
+def build_ollama_prompt(
+    post: RedditPost,
+    total_comments: int,
+    sample_comments: int,
+    corpus: str,
+) -> str:
+    header = [
+        "You are summarizing comments from a Reddit daily discussion thread.",
+        f"Thread title: {to_ascii(post.title)}",
+        f"Thread url: {post.url}",
+        f"Total comments fetched: {total_comments}",
+        f"Sample comments provided: {sample_comments}",
+        "",
+        "Instructions:",
+        "- Provide 4-6 concise bullet themes.",
+        "- State overall sentiment (bullish, bearish, mixed).",
+        "- Mention any repeated tickers or projects.",
+        "- Mention notable questions or debates (1-2).",
+        "- Keep under 200 words.",
+        "",
+        "Comments (each line is '(score) comment'):",
+    ]
+    if not corpus:
+        corpus = "- (0) No comment text available."
+    return "\n".join(header) + "\n" + corpus
+
+
+def run_ollama(prompt: str, model: str, timeout: int) -> str:
+    if shutil.which("ollama") is None:
+        raise RuntimeError("Ollama CLI not found. Install Ollama to use --summary-ollama.")
+    try:
+        result = subprocess.run(
+            ["ollama", "run", model],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Ollama failed: {exc.stderr.strip()}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Ollama timed out after {timeout} seconds.") from exc
+
+    output = result.stdout.strip()
+    if not output:
+        raise RuntimeError("Ollama returned an empty response.")
+    return output
+
+
+def summarize_with_ollama(
+    comments: Iterable[RedditComment],
+    post: RedditPost,
+    model: str,
+    max_chars: int,
+    max_comments: int,
+    timeout: int,
+) -> str:
+    comments_list = list(comments)
+    if not comments_list:
+        return "No comments available to summarize."
+    sorted_comments = sorted(comments_list, key=lambda comment: comment.score, reverse=True)
+    corpus, sample_count = build_comment_corpus(sorted_comments, max_chars, max_comments)
+    prompt = build_ollama_prompt(post, len(comments_list), sample_count, corpus)
+    return run_ollama(prompt, model, timeout)
+
+
 def write_jsonl(
     comments: Iterable[RedditComment],
     post: RedditPost,
@@ -571,6 +667,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only print the summary to stdout (skip comment output).",
     )
     parser.add_argument(
+        "--summary-ollama",
+        action="store_true",
+        help="Use a local Ollama model for the summary.",
+    )
+    parser.add_argument(
+        "--ollama-model",
+        default="llama3",
+        help="Ollama model name (default: llama3).",
+    )
+    parser.add_argument(
+        "--ollama-max-chars",
+        type=int,
+        default=12000,
+        help="Max characters of comment text sent to Ollama (default: 12000).",
+    )
+    parser.add_argument(
+        "--ollama-max-comments",
+        type=int,
+        default=200,
+        help="Max comments sent to Ollama (default: 200).",
+    )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=180,
+        help="Timeout for Ollama run in seconds (default: 180).",
+    )
+    parser.add_argument(
         "--user-agent",
         default=DEFAULT_USER_AGENT,
         help="User-Agent string for Reddit requests.",
@@ -662,9 +786,20 @@ def main() -> int:
     )
 
     summary_only = args.summary_only
+    summary_requested = args.summary or summary_only or args.summary_ollama
     summary_text = None
-    if args.summary or summary_only:
-        summary_text = summarize_comments(comments, post)
+    if summary_requested:
+        if args.summary_ollama:
+            summary_text = summarize_with_ollama(
+                comments=comments,
+                post=post,
+                model=args.ollama_model,
+                max_chars=args.ollama_max_chars,
+                max_comments=args.ollama_max_comments,
+                timeout=args.ollama_timeout,
+            )
+        else:
+            summary_text = summarize_comments(comments, post)
 
     if summary_only:
         print(summary_text)
@@ -684,7 +819,7 @@ def main() -> int:
             if output_handle is not None and output_handle is not sys.stdout:
                 output_handle.close()
 
-    if args.summary and not summary_only and summary_text is not None:
+    if summary_requested and not summary_only and summary_text is not None:
         print(summary_text, file=sys.stderr)
 
     print(

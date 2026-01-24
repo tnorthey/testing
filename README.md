@@ -53,6 +53,13 @@ To print a quick summary without writing comment data:
 python fetch_reddit_daily_discussion_comments.py \
   --summary-only
 
+To use a local Ollama model for an AI summary:
+
+python fetch_reddit_daily_discussion_comments.py \
+  --summary-only \
+  --summary-ollama \
+  --ollama-model llama3
+
 You can also pass a specific post URL or id if you already know it:
 
 python fetch_reddit_daily_discussion_comments.py \
