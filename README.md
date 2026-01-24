@@ -132,6 +132,32 @@ For public groups, you can also pass a username as the chat id (for example
 If you need older history, provide a known update offset with
 `--telegram-offset` and/or keep a local update log.
 
+### Telegram user client (full history)
+
+To access full group history, use the Telegram user client mode. This uses the
+official Telegram API via the Telethon library and requires an API ID/hash from
+https://my.telegram.org.
+
+Install Telethon:
+
+python -m pip install telethon
+
+Example:
+
+export TELEGRAM_API_ID="123456"
+export TELEGRAM_API_HASH="your-api-hash"
+
+python fetch_reddit_daily_discussion_comments.py \
+  --source telegram \
+  --telegram-mode user \
+  --telegram-chat-id @mygroup \
+  --telegram-user-phone +15551234567 \
+  --summary-only \
+  --summary-ollama
+
+The first run will prompt for the login code (and 2FA password if enabled) and
+store a local session file (default: `telegram_user`).
+
 You can also pass a specific post URL or id if you already know it:
 
 python fetch_reddit_daily_discussion_comments.py \

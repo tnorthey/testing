@@ -517,6 +517,12 @@ def parse_iso_timestamp(value: str) -> int:
     return int(parsed.timestamp())
 
 
+def datetime_to_timestamp(value: dt.datetime) -> int:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return int(value.timestamp())
+
+
 def get_telegram_token(value: Optional[str]) -> str:
     token = value or os.getenv("TELEGRAM_BOT_TOKEN", "")
     if not token:
@@ -524,6 +530,27 @@ def get_telegram_token(value: Optional[str]) -> str:
             "Telegram bot token is required. Provide --telegram-bot-token or set TELEGRAM_BOT_TOKEN."
         )
     return token.strip()
+
+
+def get_telegram_user_api_id(value: Optional[str]) -> int:
+    raw_value = value or os.getenv("TELEGRAM_API_ID", "")
+    if not raw_value:
+        raise RuntimeError(
+            "Telegram API ID is required. Provide --telegram-user-api-id or set TELEGRAM_API_ID."
+        )
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError("Telegram API ID must be an integer.") from exc
+
+
+def get_telegram_user_api_hash(value: Optional[str]) -> str:
+    api_hash = value or os.getenv("TELEGRAM_API_HASH", "")
+    if not api_hash:
+        raise RuntimeError(
+            "Telegram API hash is required. Provide --telegram-user-api-hash or set TELEGRAM_API_HASH."
+        )
+    return api_hash.strip()
 
 
 def build_telegram_url(token: str, method: str, params: dict[str, str]) -> str:
@@ -585,6 +612,23 @@ def format_telegram_author(user: object, sender_chat: object) -> tuple[str, str]
         title = sender_chat.get("title") or sender_chat.get("username") or "unknown"
         return chat_id or "unknown", str(title)
     return "unknown", "unknown"
+
+
+def format_telethon_author(sender: object, post_author: object) -> tuple[str, str]:
+    if sender is None:
+        if isinstance(post_author, str) and post_author:
+            return "unknown", post_author
+        return "unknown", "unknown"
+    sender_id = str(getattr(sender, "id", "") or "unknown")
+    username = getattr(sender, "username", None)
+    if isinstance(username, str) and username:
+        return sender_id, f"@{username}"
+    first = getattr(sender, "first_name", "") or ""
+    last = getattr(sender, "last_name", "") or ""
+    name = " ".join(part for part in (first, last) if part).strip()
+    if not name:
+        name = getattr(sender, "title", "") or "unknown"
+    return sender_id, name
 
 
 def parse_telegram_message(message: object, target_chat_id: str) -> Optional[TelegramMessage]:
@@ -699,6 +743,76 @@ def fetch_telegram_messages(
     return messages
 
 
+def fetch_telegram_user_messages(
+    chat_ref: str | int,
+    api_id: int,
+    api_hash: str,
+    session_name: str,
+    limit: int,
+    timeout: int,
+    phone: Optional[str],
+) -> tuple[list[TelegramMessage], str, Optional[str], Optional[str]]:
+    try:
+        from telethon.errors import SessionPasswordNeededError  # type: ignore[import-not-found]
+        from telethon.sync import TelegramClient  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "Telethon is required for Telegram user mode. Install with: pip install telethon"
+        ) from exc
+
+    client = TelegramClient(session_name, api_id, api_hash)
+    try:
+        client.connect()
+        if not client.is_user_authorized():
+            if not phone:
+                raise RuntimeError(
+                    "Telegram user auth required. Provide --telegram-user-phone to login."
+                )
+            client.send_code_request(phone)
+            code = input("Enter the Telegram login code: ").strip()
+            try:
+                client.sign_in(phone=phone, code=code)
+            except SessionPasswordNeededError:
+                password = input("Two-step verification enabled. Enter your password: ").strip()
+                client.sign_in(password=password)
+
+        resolved_ref: str | int = chat_ref
+        if isinstance(chat_ref, str) and chat_ref.lstrip("-").isdigit():
+            resolved_ref = int(chat_ref)
+        entity = client.get_entity(resolved_ref)
+        chat_id = str(getattr(entity, "id", "") or "")
+        if not chat_id:
+            raise RuntimeError("Unable to resolve Telegram chat.")
+        chat_username = getattr(entity, "username", None)
+        chat_title = getattr(entity, "title", None) or getattr(entity, "first_name", None)
+
+        messages: list[TelegramMessage] = []
+        for message in client.iter_messages(entity, limit=limit):
+            content = message.message or ""
+            if not content:
+                continue
+            if message.date is None:
+                continue
+            created_utc = datetime_to_timestamp(message.date)
+            author_id, author_name = format_telethon_author(
+                message.sender, getattr(message, "post_author", None)
+            )
+            messages.append(
+                TelegramMessage(
+                    message_id=str(message.id),
+                    chat_id=chat_id,
+                    author_id=author_id,
+                    author_name=author_name,
+                    content=str(content),
+                    created_utc=created_utc,
+                )
+            )
+        messages.sort(key=lambda item: item.created_utc)
+        return messages, chat_id, chat_username, chat_title
+    finally:
+        client.disconnect()
+
+
 def to_ascii(text: str) -> str:
     return text.encode("ascii", "ignore").decode("ascii")
 
@@ -762,13 +876,15 @@ def build_telegram_message_url(chat_id: str, message_id: str, username: Optional
     return ""
 
 
-def context_for_telegram_chat(chat_id: str, username: Optional[str]) -> SummaryContext:
-    title = f"Telegram chat {chat_id}"
+def context_for_telegram_chat(
+    chat_id: str, username: Optional[str], title: Optional[str] = None
+) -> SummaryContext:
+    display_title = title or f"Telegram chat {chat_id}"
     if username:
-        title = f"Telegram chat @{username}"
+        display_title = f"{display_title} (@{username})" if title else f"Telegram chat @{username}"
     return SummaryContext(
         source="Telegram",
-        title=title,
+        title=display_title,
         url=build_telegram_chat_url(chat_id, username),
     )
 
@@ -818,7 +934,7 @@ def summarize_text_items(
 ) -> str:
     items_list = list(items)
     if not items_list:
-        return "No comments available to summarize."
+        return "No entries available to summarize."
 
     author_counts = Counter(item.author for item in items_list)
     word_counts: Counter[str] = Counter()
@@ -1362,6 +1478,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Telegram bot token (defaults to TELEGRAM_BOT_TOKEN).",
     )
     parser.add_argument(
+        "--telegram-mode",
+        default="bot",
+        choices=("bot", "user"),
+        help="Telegram access mode (default: bot).",
+    )
+    parser.add_argument(
         "--telegram-chat-id",
         help="Telegram chat id to fetch messages from.",
     )
@@ -1391,6 +1513,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1000,
         help="Max Telegram updates to scan (default: 1000).",
+    )
+    parser.add_argument(
+        "--telegram-user-api-id",
+        help="Telegram API ID for user client (defaults to TELEGRAM_API_ID).",
+    )
+    parser.add_argument(
+        "--telegram-user-api-hash",
+        help="Telegram API hash for user client (defaults to TELEGRAM_API_HASH).",
+    )
+    parser.add_argument(
+        "--telegram-user-session",
+        default="telegram_user",
+        help="Telethon session name or path (default: telegram_user).",
+    )
+    parser.add_argument(
+        "--telegram-user-phone",
+        help="Phone number for Telegram user login (e.g. +15551234567).",
     )
     parser.add_argument(
         "--format",
@@ -1569,30 +1708,59 @@ def main() -> int:
         chat_username = args.telegram_chat_username.strip() if args.telegram_chat_username else None
         if raw_chat_id.startswith("@") and not chat_username:
             chat_username = raw_chat_id.lstrip("@")
-        try:
-            token = get_telegram_token(args.telegram_bot_token)
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        try:
-            chat_id = resolve_telegram_chat_id(token, raw_chat_id, args.timeout)
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        try:
-            telegram_messages = fetch_telegram_messages(
-                chat_id=chat_id,
-                token=token,
-                limit=args.telegram_limit,
-                timeout=args.timeout,
-                long_poll=args.telegram_long_poll,
-                offset=args.telegram_offset,
-                max_updates=args.telegram_max_updates,
-            )
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        context = context_for_telegram_chat(chat_id, chat_username)
+        if args.telegram_mode == "user":
+            try:
+                api_id = get_telegram_user_api_id(args.telegram_user_api_id)
+                api_hash = get_telegram_user_api_hash(args.telegram_user_api_hash)
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            try:
+                (
+                    telegram_messages,
+                    chat_id,
+                    resolved_username,
+                    chat_title,
+                ) = fetch_telegram_user_messages(
+                    chat_ref=raw_chat_id,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    session_name=args.telegram_user_session,
+                    limit=args.telegram_limit,
+                    timeout=args.timeout,
+                    phone=args.telegram_user_phone,
+                )
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            if resolved_username:
+                chat_username = resolved_username
+            context = context_for_telegram_chat(chat_id, chat_username, chat_title)
+        else:
+            try:
+                token = get_telegram_token(args.telegram_bot_token)
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            try:
+                chat_id = resolve_telegram_chat_id(token, raw_chat_id, args.timeout)
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            try:
+                telegram_messages = fetch_telegram_messages(
+                    chat_id=chat_id,
+                    token=token,
+                    limit=args.telegram_limit,
+                    timeout=args.timeout,
+                    long_poll=args.telegram_long_poll,
+                    offset=args.telegram_offset,
+                    max_updates=args.telegram_max_updates,
+                )
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            context = context_for_telegram_chat(chat_id, chat_username)
         items = telegram_messages_to_items(telegram_messages)
         output_label = (
             f"Fetched {len(telegram_messages)} messages from Telegram chat {chat_id}"
