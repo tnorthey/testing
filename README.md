@@ -69,6 +69,29 @@ python fetch_reddit_daily_discussion_comments.py \
   --summary-chatgpt \
   --openai-model gpt-4o-mini
 
+## Discord channel messages
+
+Use `fetch_reddit_daily_discussion_comments.py` with `--source discord` to read
+messages from a Discord channel. You will need a bot token with access to the
+channel.
+
+Example:
+
+export DISCORD_TOKEN="your-discord-bot-token"
+
+python fetch_reddit_daily_discussion_comments.py \
+  --source discord \
+  --discord-channel-id 123456789012345678 \
+  --output discord_messages.jsonl
+
+To summarize Discord messages locally with Ollama:
+
+python fetch_reddit_daily_discussion_comments.py \
+  --source discord \
+  --discord-channel-id 123456789012345678 \
+  --summary-only \
+  --summary-ollama
+
 You can also pass a specific post URL or id if you already know it:
 
 python fetch_reddit_daily_discussion_comments.py \

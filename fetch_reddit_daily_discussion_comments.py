@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fetch comments from a Reddit daily discussion thread.
+Fetch comments from Reddit or Discord discussions.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,7 @@ from typing import Iterable, Optional
 
 
 REDDIT_API_BASE = "https://www.reddit.com"
+DISCORD_API_BASE = "https://discord.com/api/v10"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 DEFAULT_QUERIES = "Daily Discussion,Daily General Discussion"
 DEFAULT_USER_AGENT = "crypto-price-correlation-script (reddit-daily-comments)"
@@ -141,6 +143,31 @@ class RedditComment:
     @property
     def url(self) -> str:
         return f"{REDDIT_API_BASE}{self.permalink}"
+
+
+@dataclass(frozen=True)
+class SummaryContext:
+    source: str
+    title: str
+    url: str
+
+
+@dataclass(frozen=True)
+class TextItem:
+    author: str
+    body: str
+    created_utc: int
+    score: int
+
+
+@dataclass(frozen=True)
+class DiscordMessage:
+    message_id: str
+    channel_id: str
+    author_id: str
+    author_name: str
+    content: str
+    created_utc: int
 
 
 def parse_queries(value: str) -> list[str]:
@@ -334,8 +361,149 @@ def extract_comments(
     return comments
 
 
+def get_discord_token(value: Optional[str]) -> str:
+    token = value or os.getenv("DISCORD_TOKEN", "")
+    if not token:
+        raise RuntimeError(
+            "Discord token is required. Provide --discord-token or set DISCORD_TOKEN."
+        )
+    return token.strip()
+
+
+def normalize_discord_auth(token: str) -> str:
+    lowered = token.lower()
+    if lowered.startswith("bot ") or lowered.startswith("bearer "):
+        return token
+    return f"Bot {token}"
+
+
+def build_discord_messages_url(channel_id: str, limit: int, before: Optional[str]) -> str:
+    params = {"limit": str(limit)}
+    if before:
+        params["before"] = before
+    return f"{DISCORD_API_BASE}/channels/{channel_id}/messages?{urllib.parse.urlencode(params)}"
+
+
+def format_discord_author(author: object) -> str:
+    if not isinstance(author, dict):
+        return "unknown"
+    username = str(author.get("username") or "")
+    discriminator = str(author.get("discriminator") or "")
+    global_name = author.get("global_name")
+    if isinstance(global_name, str) and global_name.strip():
+        name = global_name.strip()
+    else:
+        name = username or "unknown"
+    if username and discriminator and discriminator not in ("0", "0000"):
+        name = f"{username}#{discriminator}"
+    return name
+
+
+def parse_discord_message(data: object, channel_id: str) -> Optional[DiscordMessage]:
+    if not isinstance(data, dict):
+        return None
+    message_id = data.get("id")
+    if not message_id:
+        return None
+    author = data.get("author", {})
+    author_id = author.get("id", "unknown") if isinstance(author, dict) else "unknown"
+    content = data.get("content") or ""
+    timestamp = data.get("timestamp") or ""
+    try:
+        created_utc = parse_iso_timestamp(str(timestamp))
+    except ValueError:
+        return None
+    return DiscordMessage(
+        message_id=str(message_id),
+        channel_id=channel_id,
+        author_id=str(author_id),
+        author_name=format_discord_author(author),
+        content=str(content),
+        created_utc=created_utc,
+    )
+
+
+def fetch_discord_json(url: str, token: str, timeout: int, max_retries: int = 3) -> object:
+    headers = {
+        "Authorization": normalize_discord_auth(token),
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+    for attempt in range(max_retries + 1):
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = response.read().decode("utf-8")
+            return json.loads(payload)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+            if exc.code == 429 and attempt < max_retries:
+                retry_after = 1.0
+                if body:
+                    try:
+                        data = json.loads(body)
+                        retry_after = float(data.get("retry_after", retry_after))
+                    except (ValueError, TypeError):
+                        retry_after = 1.0
+                time.sleep(retry_after)
+                continue
+            message = body.strip() or f"{exc.code} {exc.reason}"
+            raise RuntimeError(f"Discord request failed: {message}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Discord request failed: {exc.reason}") from exc
+    raise RuntimeError("Discord request failed after retries.")
+
+
+def fetch_discord_messages(
+    channel_id: str,
+    token: str,
+    limit: int,
+    timeout: int,
+    before: Optional[str],
+) -> list[DiscordMessage]:
+    if limit <= 0:
+        return []
+    messages: list[DiscordMessage] = []
+    remaining = limit
+    before_id = before
+    while remaining > 0:
+        batch = min(100, remaining)
+        url = build_discord_messages_url(channel_id, batch, before_id)
+        payload = fetch_discord_json(url, token, timeout)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected response payload from Discord.")
+        if not payload:
+            break
+        for item in payload:
+            message = parse_discord_message(item, channel_id)
+            if message:
+                messages.append(message)
+        if len(payload) < batch:
+            break
+        before_id = payload[-1].get("id") if isinstance(payload[-1], dict) else None
+        if not before_id:
+            break
+        remaining = limit - len(messages)
+    messages.sort(key=lambda message: message.created_utc)
+    return messages
+
+
 def format_timestamp(ts: int) -> str:
     return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat()
+
+
+def parse_iso_timestamp(value: str) -> int:
+    value = value.strip()
+    if not value:
+        raise ValueError("Empty timestamp value")
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported timestamp format: {value}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return int(parsed.timestamp())
 
 
 def to_ascii(text: str) -> str:
@@ -352,24 +520,77 @@ def truncate_text(text: str, limit: int) -> str:
     return cleaned[: limit - 3].rstrip() + "..."
 
 
-def summarize_comments(
-    comments: Iterable[RedditComment],
-    post: RedditPost,
+def context_from_reddit_post(post: RedditPost) -> SummaryContext:
+    return SummaryContext(source="Reddit", title=post.title, url=post.url)
+
+
+def build_discord_channel_url(channel_id: str, guild_id: Optional[str]) -> str:
+    if guild_id:
+        return f"https://discord.com/channels/{guild_id}/{channel_id}"
+    return f"discord://channel/{channel_id}"
+
+
+def build_discord_message_url(
+    guild_id: Optional[str], channel_id: str, message_id: str
+) -> str:
+    if guild_id:
+        return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+    return ""
+
+
+def context_for_discord_channel(channel_id: str, guild_id: Optional[str]) -> SummaryContext:
+    title = f"Discord channel {channel_id}"
+    if guild_id:
+        title = f"Discord channel {channel_id} (guild {guild_id})"
+    return SummaryContext(
+        source="Discord",
+        title=title,
+        url=build_discord_channel_url(channel_id, guild_id),
+    )
+
+
+def reddit_comments_to_items(comments: Iterable[RedditComment]) -> list[TextItem]:
+    return [
+        TextItem(
+            author=comment.author,
+            body=comment.body,
+            created_utc=comment.created_utc,
+            score=comment.score,
+        )
+        for comment in comments
+    ]
+
+
+def discord_messages_to_items(messages: Iterable[DiscordMessage]) -> list[TextItem]:
+    return [
+        TextItem(
+            author=message.author_name,
+            body=message.content,
+            created_utc=message.created_utc,
+            score=0,
+        )
+        for message in messages
+    ]
+
+
+def summarize_text_items(
+    items: Iterable[TextItem],
+    context: SummaryContext,
     max_terms: int = 10,
     max_authors: int = 5,
     max_examples: int = 3,
 ) -> str:
-    comments_list = list(comments)
-    if not comments_list:
+    items_list = list(items)
+    if not items_list:
         return "No comments available to summarize."
 
-    author_counts = Counter(comment.author for comment in comments_list)
+    author_counts = Counter(item.author for item in items_list)
     word_counts: Counter[str] = Counter()
     ticker_counts: Counter[str] = Counter()
-    timestamps = [comment.created_utc for comment in comments_list]
+    timestamps = [item.created_utc for item in items_list]
 
-    for comment in comments_list:
-        body = comment.body
+    for item in items_list:
+        body = item.body
         for match in WORD_RE.finditer(body.lower()):
             word = match.group(0)
             if word in STOPWORDS:
@@ -385,14 +606,18 @@ def summarize_comments(
     top_tickers = [
         f"{ticker} ({count})" for ticker, count in ticker_counts.most_common(5)
     ]
-    top_scored = sorted(comments_list, key=lambda comment: comment.score, reverse=True)[
-        :max_examples
-    ]
+    top_scored = sorted(
+        items_list,
+        key=lambda item: (item.score, item.created_utc),
+        reverse=True,
+    )[:max_examples]
+    has_scores = any(item.score for item in items_list)
 
     lines = [
-        f"Summary for '{to_ascii(post.title)}'",
-        f"Post URL: {post.url}",
-        f"Comments: {len(comments_list)} | Unique authors: {len(author_counts)}",
+        f"Summary for '{to_ascii(context.title)}'",
+        f"Source: {context.source}",
+        f"URL: {context.url or 'N/A'}",
+        f"Entries: {len(items_list)} | Unique authors: {len(author_counts)}",
         (
             "Time range (UTC): "
             f"{format_timestamp(min(timestamps))} to {format_timestamp(max(timestamps))}"
@@ -406,16 +631,22 @@ def summarize_comments(
     if top_authors:
         lines.append("Top commenters: " + ", ".join(top_authors))
     if top_scored:
-        lines.append("Top scored comments:")
-        for comment in top_scored:
-            snippet = truncate_text(comment.body, 160)
-            lines.append(f"- ({comment.score}) {snippet}")
+        if has_scores:
+            lines.append("Top scored comments:")
+            for item in top_scored:
+                snippet = truncate_text(item.body, 160)
+                lines.append(f"- ({item.score}) {snippet}")
+        else:
+            lines.append("Sample messages:")
+            for item in top_scored:
+                snippet = truncate_text(item.body, 160)
+                lines.append(f"- {snippet}")
 
     return "\n".join(lines)
 
 
 def build_comment_corpus(
-    comments: Iterable[RedditComment],
+    comments: Iterable[TextItem],
     max_chars: int,
     max_comments: int,
 ) -> tuple[str, int]:
@@ -442,17 +673,17 @@ def build_comment_corpus(
 
 
 def build_ai_prompt(
-    post: RedditPost,
+    context: SummaryContext,
     total_comments: int,
     sample_comments: int,
     corpus: str,
 ) -> str:
     header = [
-        "You are summarizing comments from a Reddit daily discussion thread.",
-        f"Thread title: {to_ascii(post.title)}",
-        f"Thread url: {post.url}",
-        f"Total comments fetched: {total_comments}",
-        f"Sample comments provided: {sample_comments}",
+        f"You are summarizing messages from a {context.source} discussion.",
+        f"Title: {to_ascii(context.title)}",
+        f"URL: {context.url or 'N/A'}",
+        f"Total entries fetched: {total_comments}",
+        f"Sample entries provided: {sample_comments}",
         "",
         "Instructions:",
         "- Provide 4-6 concise bullet themes.",
@@ -461,10 +692,10 @@ def build_ai_prompt(
         "- Mention notable questions or debates (1-2).",
         "- Keep under 200 words.",
         "",
-        "Comments (each line is '(score) comment'):",
+        "Entries (each line is '(score) message'):",
     ]
     if not corpus:
-        corpus = "- (0) No comment text available."
+        corpus = "- (0) No message text available."
     return "\n".join(header) + "\n" + corpus
 
 
@@ -490,7 +721,7 @@ def run_openai_chat(
         "messages": [
             {
                 "role": "system",
-                "content": "You summarize Reddit comment threads with concise, factual bullets.",
+                "content": "You summarize discussion threads with concise, factual bullets.",
             },
             {"role": "user", "content": prompt},
         ],
@@ -551,25 +782,27 @@ def run_ollama(prompt: str, model: str, timeout: int) -> str:
 
 
 def summarize_with_ollama(
-    comments: Iterable[RedditComment],
-    post: RedditPost,
+    items: Iterable[TextItem],
+    context: SummaryContext,
     model: str,
     max_chars: int,
     max_comments: int,
     timeout: int,
 ) -> str:
-    comments_list = list(comments)
-    if not comments_list:
+    items_list = list(items)
+    if not items_list:
         return "No comments available to summarize."
-    sorted_comments = sorted(comments_list, key=lambda comment: comment.score, reverse=True)
-    corpus, sample_count = build_comment_corpus(sorted_comments, max_chars, max_comments)
-    prompt = build_ai_prompt(post, len(comments_list), sample_count, corpus)
+    sorted_items = sorted(
+        items_list, key=lambda item: (item.score, item.created_utc), reverse=True
+    )
+    corpus, sample_count = build_comment_corpus(sorted_items, max_chars, max_comments)
+    prompt = build_ai_prompt(context, len(items_list), sample_count, corpus)
     return run_ollama(prompt, model, timeout)
 
 
 def summarize_with_chatgpt(
-    comments: Iterable[RedditComment],
-    post: RedditPost,
+    items: Iterable[TextItem],
+    context: SummaryContext,
     model: str,
     api_key: str,
     max_chars: int,
@@ -578,12 +811,14 @@ def summarize_with_chatgpt(
     max_tokens: int,
     temperature: float,
 ) -> str:
-    comments_list = list(comments)
-    if not comments_list:
+    items_list = list(items)
+    if not items_list:
         return "No comments available to summarize."
-    sorted_comments = sorted(comments_list, key=lambda comment: comment.score, reverse=True)
-    corpus, sample_count = build_comment_corpus(sorted_comments, max_chars, max_comments)
-    prompt = build_ai_prompt(post, len(comments_list), sample_count, corpus)
+    sorted_items = sorted(
+        items_list, key=lambda item: (item.score, item.created_utc), reverse=True
+    )
+    corpus, sample_count = build_comment_corpus(sorted_items, max_chars, max_comments)
+    prompt = build_ai_prompt(context, len(items_list), sample_count, corpus)
     return run_openai_chat(prompt, model, api_key, timeout, max_tokens, temperature)
 
 
@@ -660,9 +895,79 @@ def write_csv(
         )
 
 
+def write_discord_jsonl(
+    messages: Iterable[DiscordMessage],
+    channel_id: str,
+    guild_id: Optional[str],
+    handle: object,
+) -> None:
+    channel_url = build_discord_channel_url(channel_id, guild_id)
+    for message in messages:
+        record = {
+            "source": "discord",
+            "channel_id": message.channel_id,
+            "channel_url": channel_url,
+            "message_id": message.message_id,
+            "message_url": build_discord_message_url(
+                guild_id, message.channel_id, message.message_id
+            ),
+            "author_id": message.author_id,
+            "author_name": message.author_name,
+            "content": message.content,
+            "created_utc": message.created_utc,
+            "created_iso": format_timestamp(message.created_utc),
+        }
+        handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def write_discord_csv(
+    messages: Iterable[DiscordMessage],
+    channel_id: str,
+    guild_id: Optional[str],
+    handle: object,
+) -> None:
+    channel_url = build_discord_channel_url(channel_id, guild_id)
+    writer = csv.writer(handle)
+    writer.writerow(
+        [
+            "source",
+            "channel_id",
+            "channel_url",
+            "message_id",
+            "message_url",
+            "author_id",
+            "author_name",
+            "content",
+            "created_utc",
+            "created_iso",
+        ]
+    )
+    for message in messages:
+        writer.writerow(
+            [
+                "discord",
+                message.channel_id,
+                channel_url,
+                message.message_id,
+                build_discord_message_url(guild_id, message.channel_id, message.message_id),
+                message.author_id,
+                message.author_name,
+                message.content,
+                message.created_utc,
+                format_timestamp(message.created_utc),
+            ]
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch Reddit comments from a daily discussion thread."
+        description="Fetch Reddit or Discord discussion comments."
+    )
+    parser.add_argument(
+        "--source",
+        default="reddit",
+        choices=("reddit", "discord"),
+        help="Data source to fetch (default: reddit).",
     )
     parser.add_argument(
         "--subreddit",
@@ -727,6 +1032,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-deleted",
         action="store_true",
         help="Include deleted or removed comments.",
+    )
+    parser.add_argument(
+        "--discord-token",
+        help="Discord bot token (defaults to DISCORD_TOKEN).",
+    )
+    parser.add_argument(
+        "--discord-channel-id",
+        help="Discord channel id to fetch messages from.",
+    )
+    parser.add_argument(
+        "--discord-guild-id",
+        help="Discord guild id (optional, used to build message URLs).",
+    )
+    parser.add_argument(
+        "--discord-limit",
+        type=int,
+        default=200,
+        help="Max Discord messages to fetch (default: 200).",
+    )
+    parser.add_argument(
+        "--discord-before",
+        help="Fetch Discord messages before this message id.",
     )
     parser.add_argument(
         "--format",
@@ -864,56 +1191,92 @@ def main() -> int:
     if args.summary_ollama and args.summary_chatgpt:
         print("Error: choose only one of --summary-ollama or --summary-chatgpt.", file=sys.stderr)
         return 1
+    output_kind = args.source
+    output_label = ""
+    context: SummaryContext
+    items: list[TextItem]
 
-    post_id = None
-    post = None
-    if args.post_id:
-        post_id = args.post_id.strip()
-    elif args.post_url:
-        try:
-            post_id = extract_post_id(args.post_url.strip())
-        except ValueError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+    if args.source == "discord":
+        if not args.discord_channel_id:
+            print("Error: --discord-channel-id is required for Discord source.", file=sys.stderr)
             return 1
-    else:
+        channel_id = args.discord_channel_id.strip()
+        guild_id = args.discord_guild_id.strip() if args.discord_guild_id else None
         try:
-            post = find_daily_post(args)
+            token = get_discord_token(args.discord_token)
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        post_id = post.post_id
+        try:
+            messages = fetch_discord_messages(
+                channel_id=channel_id,
+                token=token,
+                limit=args.discord_limit,
+                timeout=args.timeout,
+                before=args.discord_before,
+            )
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        context = context_for_discord_channel(channel_id, guild_id)
+        items = discord_messages_to_items(messages)
+        output_label = (
+            f"Fetched {len(messages)} messages from Discord channel "
+            f"{channel_id}"
+        )
+    else:
+        post_id = None
+        post = None
+        if args.post_id:
+            post_id = args.post_id.strip()
+        elif args.post_url:
+            try:
+                post_id = extract_post_id(args.post_url.strip())
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        else:
+            try:
+                post = find_daily_post(args)
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            post_id = post.post_id
 
-    comments_url = build_comments_url(
-        post_id=post_id,
-        sort=args.comment_sort,
-        limit=args.comment_limit,
-    )
-    try:
-        payload = fetch_json(comments_url, args.user_agent, args.timeout)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        comments_url = build_comments_url(
+            post_id=post_id,
+            sort=args.comment_sort,
+            limit=args.comment_limit,
+        )
+        try:
+            payload = fetch_json(comments_url, args.user_agent, args.timeout)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
-    if not isinstance(payload, list) or len(payload) < 2:
-        print("Error: Unexpected response payload from Reddit.", file=sys.stderr)
-        return 1
+        if not isinstance(payload, list) or len(payload) < 2:
+            print("Error: Unexpected response payload from Reddit.", file=sys.stderr)
+            return 1
 
-    post_listing = payload[0]
-    comments_listing = payload[1]
-    if post is None:
-        post = parse_post_from_listing(post_listing)
+        post_listing = payload[0]
+        comments_listing = payload[1]
+        if post is None:
+            post = parse_post_from_listing(post_listing)
 
-    if post is None:
-        print("Error: Unable to parse post metadata.", file=sys.stderr)
-        return 1
+        if post is None:
+            print("Error: Unable to parse post metadata.", file=sys.stderr)
+            return 1
 
-    max_comments = args.max_comments if args.max_comments > 0 else None
-    comments = extract_comments(
-        payload=comments_listing,
-        include_deleted=args.include_deleted,
-        min_score=args.min_score,
-        max_comments=max_comments,
-    )
+        max_comments = args.max_comments if args.max_comments > 0 else None
+        comments = extract_comments(
+            payload=comments_listing,
+            include_deleted=args.include_deleted,
+            min_score=args.min_score,
+            max_comments=max_comments,
+        )
+        context = context_from_reddit_post(post)
+        items = reddit_comments_to_items(comments)
+        output_label = f"Fetched {len(comments)} comments from '{post.title}' ({post.url})"
 
     summary_only = args.summary_only
     summary_requested = (
@@ -929,8 +1292,8 @@ def main() -> int:
                 return 1
             try:
                 summary_text = summarize_with_chatgpt(
-                    comments=comments,
-                    post=post,
+                    items=items,
+                    context=context,
                     model=args.openai_model,
                     api_key=api_key,
                     max_chars=args.openai_max_chars,
@@ -943,16 +1306,20 @@ def main() -> int:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
         elif args.summary_ollama:
-            summary_text = summarize_with_ollama(
-                comments=comments,
-                post=post,
-                model=args.ollama_model,
-                max_chars=args.ollama_max_chars,
-                max_comments=args.ollama_max_comments,
-                timeout=args.ollama_timeout,
-            )
+            try:
+                summary_text = summarize_with_ollama(
+                    items=items,
+                    context=context,
+                    model=args.ollama_model,
+                    max_chars=args.ollama_max_chars,
+                    max_comments=args.ollama_max_comments,
+                    timeout=args.ollama_timeout,
+                )
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
         else:
-            summary_text = summarize_comments(comments, post)
+            summary_text = summarize_text_items(items, context)
 
     if summary_only:
         print(summary_text)
@@ -964,10 +1331,26 @@ def main() -> int:
             else:
                 output_handle = sys.stdout
 
-            if args.format == "csv":
-                write_csv(comments, post, output_handle)
+            if output_kind == "discord":
+                if args.format == "csv":
+                    write_discord_csv(
+                        messages=messages,
+                        channel_id=channel_id,
+                        guild_id=guild_id,
+                        handle=output_handle,
+                    )
+                else:
+                    write_discord_jsonl(
+                        messages=messages,
+                        channel_id=channel_id,
+                        guild_id=guild_id,
+                        handle=output_handle,
+                    )
             else:
-                write_jsonl(comments, post, output_handle)
+                if args.format == "csv":
+                    write_csv(comments, post, output_handle)
+                else:
+                    write_jsonl(comments, post, output_handle)
         finally:
             if output_handle is not None and output_handle is not sys.stdout:
                 output_handle.close()
@@ -975,10 +1358,7 @@ def main() -> int:
     if summary_requested and not summary_only and summary_text is not None:
         print(summary_text, file=sys.stderr)
 
-    print(
-        f"Fetched {len(comments)} comments from '{post.title}' ({post.url})",
-        file=sys.stderr,
-    )
+    print(output_label, file=sys.stderr)
     return 0
 
 
