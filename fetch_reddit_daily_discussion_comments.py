@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fetch comments from Reddit or Discord discussions.
+Fetch comments from Reddit, Discord, or Telegram discussions.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from typing import Iterable, Optional
 
 REDDIT_API_BASE = "https://www.reddit.com"
 DISCORD_API_BASE = "https://discord.com/api/v10"
+TELEGRAM_API_BASE = "https://api.telegram.org"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 DEFAULT_QUERIES = "Daily Discussion,Daily General Discussion"
 DEFAULT_USER_AGENT = "crypto-price-correlation-script (reddit-daily-comments)"
@@ -164,6 +165,16 @@ class TextItem:
 class DiscordMessage:
     message_id: str
     channel_id: str
+    author_id: str
+    author_name: str
+    content: str
+    created_utc: int
+
+
+@dataclass(frozen=True)
+class TelegramMessage:
+    message_id: str
+    chat_id: str
     author_id: str
     author_name: str
     content: str
@@ -506,6 +517,188 @@ def parse_iso_timestamp(value: str) -> int:
     return int(parsed.timestamp())
 
 
+def get_telegram_token(value: Optional[str]) -> str:
+    token = value or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        raise RuntimeError(
+            "Telegram bot token is required. Provide --telegram-bot-token or set TELEGRAM_BOT_TOKEN."
+        )
+    return token.strip()
+
+
+def build_telegram_url(token: str, method: str, params: dict[str, str]) -> str:
+    base = f"{TELEGRAM_API_BASE}/bot{token}/{method}"
+    if params:
+        return f"{base}?{urllib.parse.urlencode(params)}"
+    return base
+
+
+def fetch_telegram_json(url: str, timeout: int) -> object:
+    request = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+        message = error_body.strip() or f"{exc.code} {exc.reason}"
+        raise RuntimeError(f"Telegram request failed: {message}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Telegram request failed: {exc.reason}") from exc
+    return json.loads(payload)
+
+
+def extract_telegram_result(payload: object) -> object:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected response payload from Telegram.")
+    if not payload.get("ok"):
+        description = payload.get("description") or "Telegram API error."
+        raise RuntimeError(f"Telegram request failed: {description}")
+    return payload.get("result")
+
+
+def resolve_telegram_chat_id(token: str, chat_id: str, timeout: int) -> str:
+    if chat_id.lstrip("-").isdigit():
+        return chat_id
+    params = {"chat_id": chat_id}
+    url = build_telegram_url(token, "getChat", params)
+    payload = fetch_telegram_json(url, timeout)
+    result = extract_telegram_result(payload)
+    if isinstance(result, dict) and "id" in result:
+        return str(result["id"])
+    raise RuntimeError("Unable to resolve Telegram chat id.")
+
+
+def format_telegram_author(user: object, sender_chat: object) -> tuple[str, str]:
+    if isinstance(user, dict):
+        user_id = str(user.get("id") or "")
+        username = user.get("username")
+        first = user.get("first_name") or ""
+        last = user.get("last_name") or ""
+        name = " ".join(part for part in (first, last) if part).strip()
+        if isinstance(username, str) and username:
+            name = f"@{username}"
+        if not name:
+            name = "unknown"
+        return user_id or "unknown", name
+    if isinstance(sender_chat, dict):
+        chat_id = str(sender_chat.get("id") or "")
+        title = sender_chat.get("title") or sender_chat.get("username") or "unknown"
+        return chat_id or "unknown", str(title)
+    return "unknown", "unknown"
+
+
+def parse_telegram_message(message: object, target_chat_id: str) -> Optional[TelegramMessage]:
+    if not isinstance(message, dict):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, dict):
+        return None
+    chat_id = str(chat.get("id") or "")
+    if not chat_id or chat_id != target_chat_id:
+        return None
+    message_id = message.get("message_id")
+    if message_id is None:
+        return None
+    content = message.get("text") or message.get("caption") or ""
+    if not content:
+        return None
+    created_utc = message.get("date")
+    if created_utc is None:
+        return None
+    author_id, author_name = format_telegram_author(
+        message.get("from"), message.get("sender_chat")
+    )
+    return TelegramMessage(
+        message_id=str(message_id),
+        chat_id=chat_id,
+        author_id=author_id,
+        author_name=author_name,
+        content=str(content),
+        created_utc=int(created_utc),
+    )
+
+
+def extract_telegram_messages(update: object, target_chat_id: str) -> list[TelegramMessage]:
+    if not isinstance(update, dict):
+        return []
+    messages: list[TelegramMessage] = []
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        payload = update.get(key)
+        message = parse_telegram_message(payload, target_chat_id)
+        if message:
+            messages.append(message)
+    return messages
+
+
+def fetch_telegram_updates(
+    token: str,
+    timeout: int,
+    long_poll: int,
+    limit: int,
+    offset: Optional[int],
+) -> list[object]:
+    params: dict[str, str] = {"limit": str(limit)}
+    if offset is not None:
+        params["offset"] = str(offset)
+    if long_poll > 0:
+        params["timeout"] = str(long_poll)
+    url = build_telegram_url(token, "getUpdates", params)
+    payload = fetch_telegram_json(url, timeout)
+    result = extract_telegram_result(payload)
+    if not isinstance(result, list):
+        raise RuntimeError("Unexpected result format from Telegram.")
+    return result
+
+
+def fetch_telegram_messages(
+    chat_id: str,
+    token: str,
+    limit: int,
+    timeout: int,
+    long_poll: int,
+    offset: Optional[int],
+    max_updates: int,
+) -> list[TelegramMessage]:
+    if limit <= 0:
+        return []
+    messages: list[TelegramMessage] = []
+    seen_ids: set[str] = set()
+    remaining = limit
+    next_offset = offset
+    updates_seen = 0
+
+    while remaining > 0 and updates_seen < max_updates:
+        batch_limit = min(100, remaining)
+        updates = fetch_telegram_updates(
+            token=token,
+            timeout=timeout,
+            long_poll=long_poll,
+            limit=batch_limit,
+            offset=next_offset,
+        )
+        if not updates:
+            break
+        updates_seen += len(updates)
+        for update in updates:
+            for message in extract_telegram_messages(update, chat_id):
+                if message.message_id in seen_ids:
+                    continue
+                seen_ids.add(message.message_id)
+                messages.append(message)
+                if len(messages) >= limit:
+                    break
+            if len(messages) >= limit:
+                break
+        last_update_id = updates[-1].get("update_id") if isinstance(updates[-1], dict) else None
+        if last_update_id is None:
+            break
+        next_offset = int(last_update_id) + 1
+        remaining = limit - len(messages)
+
+    messages.sort(key=lambda message: message.created_utc)
+    return messages
+
+
 def to_ascii(text: str) -> str:
     return text.encode("ascii", "ignore").decode("ascii")
 
@@ -549,6 +742,37 @@ def context_for_discord_channel(channel_id: str, guild_id: Optional[str]) -> Sum
     )
 
 
+def build_telegram_chat_url(chat_id: str, username: Optional[str]) -> str:
+    if username:
+        return f"https://t.me/{username}"
+    if chat_id.startswith("-100"):
+        internal_id = chat_id[4:]
+        if internal_id:
+            return f"https://t.me/c/{internal_id}"
+    return ""
+
+
+def build_telegram_message_url(chat_id: str, message_id: str, username: Optional[str]) -> str:
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    if chat_id.startswith("-100"):
+        internal_id = chat_id[4:]
+        if internal_id:
+            return f"https://t.me/c/{internal_id}/{message_id}"
+    return ""
+
+
+def context_for_telegram_chat(chat_id: str, username: Optional[str]) -> SummaryContext:
+    title = f"Telegram chat {chat_id}"
+    if username:
+        title = f"Telegram chat @{username}"
+    return SummaryContext(
+        source="Telegram",
+        title=title,
+        url=build_telegram_chat_url(chat_id, username),
+    )
+
+
 def reddit_comments_to_items(comments: Iterable[RedditComment]) -> list[TextItem]:
     return [
         TextItem(
@@ -562,6 +786,18 @@ def reddit_comments_to_items(comments: Iterable[RedditComment]) -> list[TextItem
 
 
 def discord_messages_to_items(messages: Iterable[DiscordMessage]) -> list[TextItem]:
+    return [
+        TextItem(
+            author=message.author_name,
+            body=message.content,
+            created_utc=message.created_utc,
+            score=0,
+        )
+        for message in messages
+    ]
+
+
+def telegram_messages_to_items(messages: Iterable[TelegramMessage]) -> list[TextItem]:
     return [
         TextItem(
             author=message.author_name,
@@ -959,14 +1195,80 @@ def write_discord_csv(
         )
 
 
+def write_telegram_jsonl(
+    messages: Iterable[TelegramMessage],
+    chat_id: str,
+    chat_username: Optional[str],
+    handle: object,
+) -> None:
+    chat_url = build_telegram_chat_url(chat_id, chat_username)
+    for message in messages:
+        record = {
+            "source": "telegram",
+            "chat_id": message.chat_id,
+            "chat_url": chat_url,
+            "message_id": message.message_id,
+            "message_url": build_telegram_message_url(
+                message.chat_id, message.message_id, chat_username
+            ),
+            "author_id": message.author_id,
+            "author_name": message.author_name,
+            "content": message.content,
+            "created_utc": message.created_utc,
+            "created_iso": format_timestamp(message.created_utc),
+        }
+        handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def write_telegram_csv(
+    messages: Iterable[TelegramMessage],
+    chat_id: str,
+    chat_username: Optional[str],
+    handle: object,
+) -> None:
+    chat_url = build_telegram_chat_url(chat_id, chat_username)
+    writer = csv.writer(handle)
+    writer.writerow(
+        [
+            "source",
+            "chat_id",
+            "chat_url",
+            "message_id",
+            "message_url",
+            "author_id",
+            "author_name",
+            "content",
+            "created_utc",
+            "created_iso",
+        ]
+    )
+    for message in messages:
+        writer.writerow(
+            [
+                "telegram",
+                message.chat_id,
+                chat_url,
+                message.message_id,
+                build_telegram_message_url(
+                    message.chat_id, message.message_id, chat_username
+                ),
+                message.author_id,
+                message.author_name,
+                message.content,
+                message.created_utc,
+                format_timestamp(message.created_utc),
+            ]
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch Reddit or Discord discussion comments."
+        description="Fetch Reddit, Discord, or Telegram discussion comments."
     )
     parser.add_argument(
         "--source",
         default="reddit",
-        choices=("reddit", "discord"),
+        choices=("reddit", "discord", "telegram"),
         help="Data source to fetch (default: reddit).",
     )
     parser.add_argument(
@@ -1054,6 +1356,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--discord-before",
         help="Fetch Discord messages before this message id.",
+    )
+    parser.add_argument(
+        "--telegram-bot-token",
+        help="Telegram bot token (defaults to TELEGRAM_BOT_TOKEN).",
+    )
+    parser.add_argument(
+        "--telegram-chat-id",
+        help="Telegram chat id to fetch messages from.",
+    )
+    parser.add_argument(
+        "--telegram-chat-username",
+        help="Telegram chat username (used to build message URLs).",
+    )
+    parser.add_argument(
+        "--telegram-limit",
+        type=int,
+        default=200,
+        help="Max Telegram messages to fetch (default: 200).",
+    )
+    parser.add_argument(
+        "--telegram-offset",
+        type=int,
+        help="Telegram update offset to start fetching from.",
+    )
+    parser.add_argument(
+        "--telegram-long-poll",
+        type=int,
+        default=0,
+        help="Telegram long poll duration in seconds (default: 0).",
+    )
+    parser.add_argument(
+        "--telegram-max-updates",
+        type=int,
+        default=1000,
+        help="Max Telegram updates to scan (default: 1000).",
     )
     parser.add_argument(
         "--format",
@@ -1224,6 +1561,42 @@ def main() -> int:
             f"Fetched {len(messages)} messages from Discord channel "
             f"{channel_id}"
         )
+    elif args.source == "telegram":
+        if not args.telegram_chat_id:
+            print("Error: --telegram-chat-id is required for Telegram source.", file=sys.stderr)
+            return 1
+        raw_chat_id = str(args.telegram_chat_id).strip()
+        chat_username = args.telegram_chat_username.strip() if args.telegram_chat_username else None
+        if raw_chat_id.startswith("@") and not chat_username:
+            chat_username = raw_chat_id.lstrip("@")
+        try:
+            token = get_telegram_token(args.telegram_bot_token)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        try:
+            chat_id = resolve_telegram_chat_id(token, raw_chat_id, args.timeout)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        try:
+            telegram_messages = fetch_telegram_messages(
+                chat_id=chat_id,
+                token=token,
+                limit=args.telegram_limit,
+                timeout=args.timeout,
+                long_poll=args.telegram_long_poll,
+                offset=args.telegram_offset,
+                max_updates=args.telegram_max_updates,
+            )
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        context = context_for_telegram_chat(chat_id, chat_username)
+        items = telegram_messages_to_items(telegram_messages)
+        output_label = (
+            f"Fetched {len(telegram_messages)} messages from Telegram chat {chat_id}"
+        )
     else:
         post_id = None
         post = None
@@ -1344,6 +1717,21 @@ def main() -> int:
                         messages=messages,
                         channel_id=channel_id,
                         guild_id=guild_id,
+                        handle=output_handle,
+                    )
+            elif output_kind == "telegram":
+                if args.format == "csv":
+                    write_telegram_csv(
+                        messages=telegram_messages,
+                        chat_id=chat_id,
+                        chat_username=chat_username,
+                        handle=output_handle,
+                    )
+                else:
+                    write_telegram_jsonl(
+                        messages=telegram_messages,
+                        chat_id=chat_id,
+                        chat_username=chat_username,
                         handle=output_handle,
                     )
             else:

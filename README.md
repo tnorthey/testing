@@ -107,6 +107,31 @@ python fetch_reddit_daily_discussion_comments.py \
   --summary-only \
   --summary-ollama
 
+## Telegram group messages
+
+Use `fetch_reddit_daily_discussion_comments.py` with `--source telegram` to read
+messages from a Telegram group via the Bot API. The bot must be in the group,
+and it only receives updates after it is added (unless you run your own client
+using the full Telegram API). If the group has privacy enabled, the bot may only
+see messages that mention it.
+
+Example:
+
+export TELEGRAM_BOT_TOKEN="your-telegram-bot-token"
+
+python fetch_reddit_daily_discussion_comments.py \
+  --source telegram \
+  --telegram-chat-id -1001234567890 \
+  --telegram-chat-username mygroup \
+  --summary-only \
+  --summary-ollama
+
+For public groups, you can also pass a username as the chat id (for example
+`--telegram-chat-id @mygroup`).
+
+If you need older history, provide a known update offset with
+`--telegram-offset` and/or keep a local update log.
+
 You can also pass a specific post URL or id if you already know it:
 
 python fetch_reddit_daily_discussion_comments.py \
