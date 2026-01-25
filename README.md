@@ -53,6 +53,49 @@ To print a quick summary without writing comment data:
 python fetch_reddit_daily_discussion_comments.py \
   --summary-only
 
+To fetch a specific past daily discussion (UTC date) and summarize it:
+
+python fetch_reddit_daily_discussion_comments.py \
+  --date 2026-01-10 \
+  --summary-only
+
+To cache fetched JSON locally (and reuse it on subsequent runs):
+
+python fetch_reddit_daily_discussion_comments.py \
+  --date 2026-01-10 \
+  --summary-only \
+  --cache-dir reddit_cache
+
+To force a refetch even if cached data exists:
+
+python fetch_reddit_daily_discussion_comments.py \
+  --date 2026-01-10 \
+  --summary-only \
+  --cache-dir reddit_cache \
+  --refresh-cache
+
+To fetch the daily discussion from N days ago (UTC) and summarize it:
+
+python fetch_reddit_daily_discussion_comments.py \
+  --days-ago 7 \
+  --summary-only
+
+To summarize the last N days of daily discussions (UTC):
+
+python fetch_reddit_daily_discussion_comments.py \
+  --past-days 14 \
+  --summary-only \
+  --cache-dir reddit_cache
+
+To build a CSV of `date_utc -> upvotes` for the best *comment* whose body is exactly
+`Ethereum` / `Ethereum!` / `Ethereum.` (case-insensitive) per day (uses your cached
+`ethereum_post_*.json` files):
+
+python fetch_reddit_daily_discussion_comments.py \
+  --past-days 30 \
+  --cache-dir reddit_cache \
+  --ethereum-upvotes-csv ethereum_upvotes.csv
+
 You can also pass a specific post URL or id if you already know it:
 
 python fetch_reddit_daily_discussion_comments.py \
